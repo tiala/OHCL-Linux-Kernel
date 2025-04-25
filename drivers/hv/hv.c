@@ -313,7 +313,6 @@ void hv_synic_enable_regs(unsigned int cpu)
 	if (vmbus_irq != -1)
 		enable_percpu_irq(vmbus_irq, 0);
 	shared_sint.as_uint64 = hv_get_msr(HV_MSR_SINT0 + VMBUS_MESSAGE_SINT);
-
 	shared_sint.vector = vmbus_interrupt;
 	shared_sint.masked = false;
 
@@ -352,8 +351,8 @@ void hv_synic_disable_regs(unsigned int cpu)
 	/* Need to correctly cleanup in the case of SMP!!! */
 	/* Disable the interrupt */
 	hv_set_msr(HV_MSR_SINT0 + VMBUS_MESSAGE_SINT, shared_sint.as_uint64);
-
 	hv_enable_coco_interrupt(cpu, vmbus_interrupt, false);
+
 	simp.as_uint64 = hv_get_msr(HV_MSR_SIMP);
 	/*
 	 * In Isolation VM, sim and sief pages are allocated by
