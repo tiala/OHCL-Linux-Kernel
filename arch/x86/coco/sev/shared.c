@@ -41,6 +41,7 @@ u8 snp_vmpl __ro_after_init;
 EXPORT_SYMBOL_GPL(snp_vmpl);
 static struct svsm_ca *boot_svsm_caa __ro_after_init;
 static u64 boot_svsm_caa_pa __ro_after_init;
+static bool xf_page_flag;
 
 static struct svsm_ca *svsm_get_caa(void);
 static u64 svsm_get_caa_pa(void);
@@ -97,6 +98,19 @@ static u16 ghcb_version __ro_after_init;
 
 /* Copy of the SNP firmware's CPUID page. */
 static struct snp_cpuid_table cpuid_table_copy __ro_after_init;
+
+static struct snp_cpuid_table cpuid_xf_table_copy __ro_after_init;
+
+static const struct snp_cpuid_table *snp_cpuid_xf_get_table(void)
+{
+	void *ptr;
+
+	asm ("lea cpuid_xf_table_copy(%%rip), %0"
+	     : "=r" (ptr)
+	     : "p" (&cpuid_xf_table_copy));
+
+	return ptr;
+}
 
 /*
  * These will be initialized based on CPUID table so that non-present
@@ -499,6 +513,15 @@ static const struct snp_cpuid_table *snp_cpuid_get_table(void)
  *
  * Return: XSAVE area size on success, 0 otherwise.
  */
+
+static int __init enable_xf_page(char *str)
+{
+	xf_page_flag = true;
+	return 0;
+}
+
+__setup("cpuid_xf_page", enable_xf_page);
+
 static u32 snp_cpuid_calc_xsave_size(u64 xfeatures_en, bool compacted)
 {
 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
@@ -610,46 +633,63 @@ static int snp_cpuid_postprocess(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
 		/* extended APIC ID */
 		leaf->edx = leaf_hv.edx;
 		break;
-	case 0xD: {
-		bool compacted = false;
-		u64 xcr0 = 1, xss = 0;
-		u32 xsave_size;
+	case 0xD:
+		if (xf_page_flag) {
+			const struct snp_cpuid_table *cpuid_xf_table = snp_cpuid_xf_get_table();
+			int i = 0;
 
-		if (leaf->subfn != 0 && leaf->subfn != 1)
-			return 0;
+			for (i = 0; i < SNP_CPUID_COUNT_MAX; i++) {
+				const struct snp_cpuid_fn *fn = &cpuid_xf_table->fn[i];
+				if (leaf->fn == fn->eax_in
+				    && leaf->subfn == fn->ecx_in) {
+					leaf->eax = fn->eax;
+					leaf->ebx = fn->ebx;
+					leaf->ecx = fn->ecx;
+					leaf->edx = fn->edx;
+					break;
+				}
+			}
+		} else {
+			bool compacted = false;
+			u64 xcr0 = 1, xss = 0;
+			u32 xsave_size;
 
-		if (native_read_cr4() & X86_CR4_OSXSAVE)
-			xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
-		if (leaf->subfn == 1) {
-			/* Get XSS value if XSAVES is enabled. */
-			if (leaf->eax & BIT(3)) {
-				unsigned long lo, hi;
+			if (leaf->subfn != 0 && leaf->subfn != 1)
+				return 0;
 
-				asm volatile("rdmsr" : "=a" (lo), "=d" (hi)
-						     : "c" (MSR_IA32_XSS));
-				xss = (hi << 32) | lo;
+			if (native_read_cr4() & X86_CR4_OSXSAVE)
+				xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
+			if (leaf->subfn == 1) {
+				/* Get XSS value if XSAVES is enabled. */
+				if (leaf->eax & BIT(3)) {
+					unsigned long lo, hi;
+
+					asm volatile("rdmsr" : "=a" (lo), "=d" (hi)
+							     : "c" (MSR_IA32_XSS));
+					xss = (hi << 32) | lo;
+				}
+
+				/*
+				 * The PPR and APM aren't clear on what size should be
+				 * encoded in 0xD:0x1:EBX when compaction is not enabled
+				 * by either XSAVEC (feature bit 1) or XSAVES (feature
+				 * bit 3) since SNP-capable hardware has these feature
+				 * bits fixed as 1. KVM sets it to 0 in this case, but
+				 * to avoid this becoming an issue it's safer to simply
+				 * treat this as unsupported for SNP guests.
+				 */
+				if (!(leaf->eax & (BIT(1) | BIT(3))))
+					return -EINVAL;
+
+				compacted = true;
+
 			}
 
-			/*
-			 * The PPR and APM aren't clear on what size should be
-			 * encoded in 0xD:0x1:EBX when compaction is not enabled
-			 * by either XSAVEC (feature bit 1) or XSAVES (feature
-			 * bit 3) since SNP-capable hardware has these feature
-			 * bits fixed as 1. KVM sets it to 0 in this case, but
-			 * to avoid this becoming an issue it's safer to simply
-			 * treat this as unsupported for SNP guests.
-			 */
-			if (!(leaf->eax & (BIT(1) | BIT(3))))
+			xsave_size = snp_cpuid_calc_xsave_size(xcr0 | xss, compacted);
+			if (!xsave_size)
 				return -EINVAL;
 
-			compacted = true;
-		}
-
-		xsave_size = snp_cpuid_calc_xsave_size(xcr0 | xss, compacted);
-		if (!xsave_size)
-			return -EINVAL;
-
-		leaf->ebx = xsave_size;
+			leaf->ebx = xsave_size;
 		}
 		break;
 	case 0x8000001E:
@@ -1225,6 +1265,18 @@ static void __head setup_cpuid_table(const struct cc_blob_sev_info *cc_info)
 			RIP_REL_REF(cpuid_hyp_range_max) = fn->eax;
 		else if (fn->eax_in == 0x80000000)
 			RIP_REL_REF(cpuid_ext_range_max) = fn->eax;
+	}
+
+	if (cc_info->cpuid_len == PAGE_SIZE * 2) {
+		const struct snp_cpuid_table *cpuid_xf_table_fw, *cpuid_xf_table;
+
+		cpuid_xf_table_fw =
+			(const struct snp_cpuid_table *)(cc_info->cpuid_phys + PAGE_SIZE);
+		if (!cpuid_table_fw->count || cpuid_xf_table_fw->count > SNP_CPUID_COUNT_MAX)
+			sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_CPUID);
+
+		cpuid_xf_table = snp_cpuid_xf_get_table();
+		memcpy((void *)cpuid_xf_table, cpuid_xf_table_fw, sizeof(*cpuid_xf_table));
 	}
 }
 
